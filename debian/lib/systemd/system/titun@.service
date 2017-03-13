@@ -3,6 +3,8 @@ Description=TiTun instance %I
 
 [Service]
 Type=notify
+# Environment=RUST_LOG=debug
+# Environment=RUST_BACKTRACE=1
 ExecStart=/usr/bin/titun tun -c /etc/titun/%I.yml
 NotifyAccess=all
 

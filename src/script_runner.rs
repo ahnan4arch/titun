@@ -23,6 +23,12 @@ pub struct ScriptRunner {
     c: Command,
 }
 
+impl Default for ScriptRunner {
+    fn default() -> Self {
+        ScriptRunner::new()
+    }
+}
+
 impl ScriptRunner {
     pub fn new() -> ScriptRunner {
         ScriptRunner { c: Command::new("sh") }
@@ -39,7 +45,9 @@ impl ScriptRunner {
     pub fn run<R>(mut self, mut r: R) -> Result<()>
         where R: Read
     {
-        let mut p = self.c.stdin(Stdio::piped()).spawn()?;
+        let mut p = self.c
+            .stdin(Stdio::piped())
+            .spawn()?;
         copy(&mut r, p.stdin.as_mut().unwrap())?;
         let r = p.wait()?;
         if r.success() {

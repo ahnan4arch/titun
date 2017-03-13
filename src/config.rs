@@ -15,126 +15,138 @@
 // You should have received a copy of the GNU General Public License
 // along with TiTun.  If not, see <https://www.gnu.org/licenses/>.
 
-use crypto::DEFAULT_MAX_DIFF;
-use data_encoding::base64;
+extern crate serde_yaml;
+extern crate rustc_serialize;
+
+use self::rustc_serialize::base64::FromBase64;
+use self::serde_yaml as yaml;
 use error::Result;
-use serde_yaml as yaml;
-use sodiumoxide::crypto::secretbox::{Key, gen_key};
-use std::convert::From;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use wireguard::{PeerInfo, WgInfo};
+use wireguard::re_exports::U8Array;
 
 #[derive(Serialize, Deserialize)]
-struct Config1 {
-    pub bind: Option<String>,
-    pub peer: Option<String>,
+struct PeerConfigSerde {
+    pub public_key: String,
+    pub endpoint: Option<String>,
+    pub allowed_ips: Vec<String>,
+    pub keep_alive: Option<u16>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConfigSerde {
+    pub dev_name: String,
+    pub listen_port: Option<u16>,
+    pub psk: Option<String>,
     pub key: String,
+    pub peers: Vec<PeerConfigSerde>,
+
     pub on_up: Option<String>,
     pub on_down: Option<String>,
-    pub bufsize: Option<usize>,
-    pub max_diff: Option<u64>,
-    pub dev_name: Option<String>,
 }
 
-/// One of bind / peer must be set.
-#[derive(Debug, PartialEq, Eq)]
 pub struct Config {
-    pub bind: Option<SocketAddr>,
-    pub peer: Option<SocketAddr>,
-    pub key: Key,
+    pub dev_name: String,
+    pub listen_port: Option<u16>,
+    pub info: WgInfo,
+    pub peers: Vec<PeerInfo>,
     pub on_up: Option<String>,
     pub on_down: Option<String>,
-    pub bufsize: usize,
-    pub max_diff: u64,
-    pub dev_name: Option<String>,
 }
 
-fn to_socket_addr(s: &str) -> Result<SocketAddr> {
+fn to_socket_addr<S>(s: S) -> Result<SocketAddr>
+    where S: ToSocketAddrs
+{
     for a in s.to_socket_addrs()? {
         return Ok(a);
     }
     Err(From::from("cannot resolve host"))
 }
 
+fn base64_to_arr<A>(x: String) -> Result<A>
+    where A: U8Array
+{
+    let x = x.from_base64()?;
+    if x.len() == A::len() {
+        Ok(A::from_slice(&x))
+    } else {
+        Err(From::from("not 32 bytes"))
+    }
+}
+
+fn parse_cidr<S>(s: S) -> Result<(IpAddr, u32)>
+    where S: AsRef<str>
+{
+    let s = s.as_ref();
+
+    let ss = s.split('/').collect::<Vec<_>>();
+
+    if ss.len() == 2 {
+        let a = ss[0].parse()?;
+        let p = ss[1].parse()?;
+        Ok((a, p))
+    } else if ss.len() == 1 {
+        let a = ss[0].parse()?;
+        let prefix = match a {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        Ok((a, prefix))
+    } else {
+        Err(From::from("failed to parse allowed IPs."))
+    }
+}
+
+fn lift_err<T>(x: Option<Result<T>>) -> Result<Option<T>> {
+    match x {
+        Some(Ok(t)) => Ok(Some(t)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+// Will only get the first error.
+fn lift_err_vec<T>(x: Vec<Result<T>>) -> Result<Vec<T>> {
+    let mut z = Vec::new();
+    for y in x {
+        z.push(y?);
+    }
+    Ok(z)
+}
+
 impl Config {
     pub fn parse(s: &str) -> Result<Config> {
-        let v: yaml::Value = yaml::from_str(s)?;
-        if let yaml::Value::Mapping(ref m) = v {
-            for k in m.keys() {
-                let k = k.as_str().unwrap();
-                match k {
-                    "bind" | "peer" | "key" | "on_up" | "on_down" | "bufsize" | "max_diff" |
-                    "dev_name" => {}
-                    _ => warn!("unknown config {}", k),
-                }
-            }
-        }
-        let c: Config1 = yaml::from_value(v)?;
+        let c: ConfigSerde = yaml::from_str(s)?;
 
-        let key = decode_key(&c.key).ok_or_else(|| "Config: Failed to decode key")?;
+        let psk = lift_err(c.psk.map(base64_to_arr))?;
 
-        if c.peer.is_none() && c.bind.is_none() {
-            return Err(From::from("Config: one of `bind` or `peer` must be specified"));
-        }
-        let peer = if let Some(p) = c.peer {
-            Some(to_socket_addr(&p)?)
-        } else {
-            None
-        };
-        let bind = if let Some(b) = c.bind {
-            Some(to_socket_addr(&b)?)
-        } else {
-            None
-        };
+        let key = base64_to_arr(c.key)?;
+
+        let peers = lift_err_vec(c.peers
+            .into_iter()
+            .map(|p| {
+                let pk = base64_to_arr(p.public_key)?;
+                let endpoint = lift_err(p.endpoint.map(to_socket_addr))?;
+                let allowed_ips = lift_err_vec(p.allowed_ips
+                    .into_iter()
+                    .map(parse_cidr)
+                    .collect())?;
+                Ok(PeerInfo {
+                    peer_pubkey: pk,
+                    endpoint: endpoint,
+                    allowed_ips: allowed_ips,
+                    keep_alive_interval: p.keep_alive,
+                })
+            })
+            .collect())?;
 
         Ok(Config {
-            bind: bind,
-            peer: peer,
-            key: key,
+            dev_name: c.dev_name,
+            listen_port: c.listen_port,
+            info: WgInfo::new(psk, key),
+            peers: peers,
             on_up: c.on_up,
             on_down: c.on_down,
-            bufsize: c.bufsize.unwrap_or(65536),
-            max_diff: c.max_diff.unwrap_or(DEFAULT_MAX_DIFF),
-            dev_name: c.dev_name,
         })
-    }
-}
-
-pub fn decode_key(k: &str) -> Option<Key> {
-    base64::decode(k.as_bytes()).ok().and_then(|k| Key::from_slice(k.as_slice()))
-}
-
-pub fn genkey_base64() -> String {
-    let k = gen_key();
-    base64::encode(k.0.as_ref())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_key_works() {
-        let k = genkey_base64();
-        assert!(decode_key(&k).is_some());
-        assert!(decode_key("not a valid key").is_none());
-    }
-
-    #[test]
-    fn parse_config() {
-        let c0 = Config {
-            bind: None,
-            peer: Some("127.0.0.1:3000".parse().unwrap()),
-            key: decode_key("Q3bSSKKonSsSt09ShImoD6JXf4z+r2ngQaCk/FFKwF8=").unwrap(),
-            on_up: None,
-            on_down: None,
-            bufsize: 65536,
-            max_diff: ::crypto::DEFAULT_MAX_DIFF,
-            dev_name: None,
-        };
-        let c = Config::parse(r#"---
-peer: "127.0.0.1:3000"
-key: "Q3bSSKKonSsSt09ShImoD6JXf4z+r2ngQaCk/FFKwF8="
-"#);
-        assert_eq!(c.unwrap(), c0);
     }
 }

@@ -11,24 +11,23 @@ name = "titun"
 path = "src/main.rs"
 
 [dependencies]
+blake2-rfc = "0.2.17"
 byteorder = "1.0.0"
 clap = "2.19.3"
-data-encoding = "1.1.2"
 env_logger = "0.4.0"
-futures = "0.1.7"
 log = "0.3.6"
-mio = "0.6.2"
 nix = "0.7.0"
+noise-protocol = { git = "https://github.com/sopium/noise-rust", branch = "sodium_aeads" }
+noise-sodiumoxide = { git = "https://github.com/sopium/noise-rust", branch = "sodium_aeads" }
+pnet = "0.16.0"
+rustc-serialize = "0.3.22"
 serde = "0.9.4"
 serde_derive = "0.9.4"
 serde_yaml = "0.6.0"
-sodiumoxide = "0.0.14"
-tokio-core = "0.1.2"
-tokio-signal = "0.1"
+sodiumoxide = { default-features = false, git = "https://github.com/sopium/sodiumoxide"}
+tai64 = { git = "https://github.com/sopium/tai64" }
+treebitmap = { git = "https://github.com/sopium/treebitmap" }
 
 [lib]
 name = "titun"
 path = "src/lib.rs"
-
-[profile.release]
-lto = true

@@ -15,22 +15,9 @@
 // You should have received a copy of the GNU General Public License
 // along with TiTun.  If not, see <https://www.gnu.org/licenses/>.
 
-#![feature(ptr_eq)]
-#![feature(integer_atomics)]
-#![feature(untagged_unions)]
+extern crate noise_protocol;
+extern crate noise_sodiumoxide;
 
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate nix;
-#[macro_use]
-extern crate serde_derive;
-
-mod crypto;
-pub mod config;
-pub mod error;
-pub mod script_runner;
-pub mod systemd;
-pub mod tun;
-pub mod wireguard;
-pub mod run;
+pub use self::noise_protocol::{Cipher, DH, Hash, U8Array};
+pub use self::noise_sodiumoxide::{ChaCha20Poly1305, Sensitive, X25519};
+pub use self::noise_sodiumoxide::init as sodium_init;
