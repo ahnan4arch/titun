@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with TiTun.  If not, see <https://www.gnu.org/licenses/>.
 
-#![feature(ptr_eq)]
 #![feature(integer_atomics)]
 #![feature(untagged_unions)]
 
