@@ -100,8 +100,6 @@ pub struct PeerState {
     transport1: Option<Transport>,
     transport2: Option<Transport>,
 
-    // Rekey because of REKEY_AFTER_TIME.
-    rekey_after_time: TimerHandle,
     // Rekey because of send but not recv in...
     rekey_no_recv: TimerHandle,
     // Keep alive because of recv but not send in...
@@ -126,6 +124,7 @@ type SecretKey = <ChaCha20Poly1305 as Cipher>::Key;
 struct Transport {
     self_id: IdMapGuard,
     peer_id: Id,
+    is_initiator: bool,
     // If we are responder, should not send until received one packet.
     is_initiator_or_has_received: AtomicBool,
     // Also should not send after REJECT_AFTER_TIME,
@@ -195,7 +194,7 @@ fn udp_process_handshake_init(wg: Arc<WgState>, sock: &UdpSocket, p: &[u8], addr
                                            r.peer_id,
                                            r.handshake_state);
             peer.set_endpoint(addr);
-            peer.push_transport(t, false);
+            peer.push_transport(t);
             // Lock id_map.
             wg.id_map.write().unwrap().insert(self_id, peer0.clone());
             debug!("Handshake successful as responder.");
@@ -259,7 +258,7 @@ fn udp_process_handshake_resp(wg: &WgState, sock: &UdpSocket, p: &[u8], addr: So
         let mut peer = peer0.write().unwrap();
         let handle = peer.handshake.take().unwrap().self_id;
         let t = Transport::new_from_hs(handle, peer_id, hs);
-        peer.push_transport(t, true);
+        peer.push_transport(t);
         peer.set_endpoint(addr);
         // Send an empty packet for key confirmation.
         do_keep_alive(&peer, sock);
@@ -323,13 +322,7 @@ fn udp_process_transport(wg: &WgState, tun: &Tun, p: &[u8], addr: SocketAddr) {
                         tun.write(&decrypted[..len as usize]).unwrap();
                     }
                 }
-                if decrypted.len() > 0 {
-                    peer.on_recv();
-                } else {
-                    // For keep-alive packet, only cancel re-key.
-                    // I.e., do not activate keep-alive because of keep-alive.
-                    peer.rekey_no_recv.de_activate();
-                }
+                peer.on_recv(decrypted.len() == 0);
                 peer.info.endpoint != Some(addr)
             } else {
                 debug!("Get transport message, decryption failed.");
@@ -448,18 +441,21 @@ pub fn start_tun_packet_processing(wg: Arc<WgState>, sock: Arc<UdpSocket>, tun: 
                     continue;
                 }
 
-                let (t, should_handshake) = peer.find_transport_to_send();
-                if let Some(t) = t {
+                if let Some(t) = peer.find_transport_to_send() {
                     let mut encrypted: [u8; BUFSIZE] = unsafe { uninitialized() };
                     let encrypted = &mut encrypted[..pkt.len() + 32];
-                    if t.encrypt(pkt, encrypted).is_err() {
-                        continue;
+                    let (result, should_handshake) = t.encrypt(pkt, encrypted);
+                    if result.is_ok() {
+                        sock.send_to(encrypted, peer.get_endpoint().unwrap()).unwrap();
+                        peer.on_send(false);
                     }
-                    sock.send_to(encrypted, peer.get_endpoint().unwrap()).unwrap();
-                    peer.on_send();
-                    false
+                    // Optimization: don't bother `do_handshake` if there is already
+                    // an ongoing handshake.
+                    should_handshake && peer.handshake.is_none()
                 } else {
-                    should_handshake
+                    // Optimization: don't bother `do_handshake` if there is already
+                    // an ongoing handshake.
+                    peer.handshake.is_none()
                 }
                 // Release peer.
             };
@@ -539,26 +535,21 @@ fn do_keep_alive(peer: &PeerState, sock: &UdpSocket) {
     }
     let e = e.unwrap();
 
-    let t = peer.find_transport_to_send().0;
+    let t = peer.find_transport_to_send();
     if t.is_none() {
         return;
     }
     let t = t.unwrap();
 
     let mut out = [0u8; 32];
-    if t.encrypt(&[], &mut out).is_err() {
+    if t.encrypt(&[], &mut out).0.is_err() {
         return;
     }
 
     debug!("Keep alive.");
     sock.send_to(&out, e).unwrap();
 
-    // We do not expect a reply for a keep-alive packet.
-    // So do not activate rekey_no_recv.
-    peer.keep_alive.de_activate();
-    peer.info.keep_alive_interval.as_ref().map(|&i| {
-        peer.persistent_keep_alive.adjust_and_activate(i as u64);
-    });
+    peer.on_send(true);
 }
 
 // Cannot be a method because we need `Arc<WgState>`.
@@ -577,7 +568,6 @@ pub fn wg_add_peer(wg: Arc<WgState>, peer: &PeerInfo, sock: Arc<UdpSocket>) {
         transport0: None,
         transport1: None,
         transport2: None,
-        rekey_after_time: register(dummy_action()),
         rekey_no_recv: register(dummy_action()),
         keep_alive: register(dummy_action()),
         persistent_keep_alive: register(dummy_action()),
@@ -589,17 +579,6 @@ pub fn wg_add_peer(wg: Arc<WgState>, peer: &PeerInfo, sock: Arc<UdpSocket>) {
     {
         let weak_ps = Arc::downgrade(&ps);
         let mut psw = ps.write().unwrap();
-        psw.rekey_after_time = {
-            let wg = wg.clone();
-            let weak_ps = weak_ps.clone();
-            let sock = sock.clone();
-            register(Box::new(move || {
-                weak_ps.upgrade().map(|p| {
-                    debug!("Timer: rekey after time.");
-                    do_handshake(wg.clone(), p, sock.clone());
-                });
-            }))
-        };
         // Same with rekey.
         psw.rekey_no_recv = {
             let wg = wg.clone();
@@ -749,7 +728,6 @@ impl PeerState {
         self.transport1 = None;
         self.transport2 = None;
 
-        self.rekey_after_time.de_activate();
         self.rekey_no_recv.de_activate();
         self.keep_alive.de_activate();
         self.persistent_keep_alive.de_activate();
@@ -757,66 +735,66 @@ impl PeerState {
     }
 
     // rekey = is_initiator.
-    fn on_new_transport(&self, rekey: bool) {
-        if rekey {
-            self.rekey_after_time.adjust_and_activate(REKEY_AFTER_TIME);
-        } else {
-            self.rekey_after_time.de_activate();
-        }
+    fn on_new_transport(&self) {
         self.clear.adjust_and_activate(3 * REJECT_AFTER_TIME);
         self.info.keep_alive_interval.as_ref().map(|i| {
             self.persistent_keep_alive.adjust_and_activate(*i as u64);
         });
     }
 
-    fn on_recv(&self) {
+    fn on_recv(&self, is_keepalive: bool) {
         self.rekey_no_recv.de_activate();
-        self.keep_alive.adjust_and_activate_if_not_activated(KEEPALIVE_TIMEOUT);
+        if !is_keepalive {
+            self.keep_alive.adjust_and_activate_if_not_activated(KEEPALIVE_TIMEOUT);
+        }
     }
 
-    fn on_send(&self) {
+    fn on_send(&self, is_keepalive: bool) {
         self.keep_alive.de_activate();
-        self.rekey_no_recv.adjust_and_activate_if_not_activated(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT);
+        if !is_keepalive {
+            self.rekey_no_recv.
+                adjust_and_activate_if_not_activated(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT);
+        }
         self.info.keep_alive_interval.as_ref().map(|i| {
             self.persistent_keep_alive.adjust_and_activate(*i as u64);
         });
     }
 
-    fn push_transport(&mut self, t: Transport, is_initiator: bool) {
-        self.on_new_transport(is_initiator);
+    fn push_transport(&mut self, t: Transport) {
+        self.on_new_transport();
 
         self.transport2 = self.transport1.take();
         self.transport1 = self.transport0.take();
         self.transport0 = Some(t);
     }
 
-    /// Find a transport to send packet. And indicate whether we should initiate handshake.
-    fn find_transport_to_send(&self) -> (Option<&Transport>, bool) {
+    /// Find a transport to send packet.
+    fn find_transport_to_send(&self) -> Option<&Transport> {
         // If there exists any transport, we rely on timers to init handshake.
 
         if let Some(ref t) = self.transport0 {
             if t.get_should_send() {
-                return (Some(t), false);
+                return Some(t);
             }
         } else {
-            return (None, true);
+            return None;
         }
 
         if let Some(ref t) = self.transport1 {
             if t.get_should_send() {
-                return (Some(t), false);
+                return Some(t);
             }
         } else {
-            return (None, false);
+            return None;
         }
 
         if let Some(ref t) = self.transport2 {
             if t.get_should_send() {
-                return (Some(t), false);
+                return Some(t);
             }
         }
 
-        (None, false)
+        None
     }
 
     fn find_transport_by_id(&self, id: Id) -> Option<&Transport> {
@@ -859,6 +837,7 @@ impl Transport {
         Transport {
             self_id: self_id,
             peer_id: peer_id,
+            is_initiator: hs.get_is_initiator(),
             is_initiator_or_has_received: AtomicBool::new(hs.get_is_initiator()),
             not_too_old: AtomicBool::new(true),
             send_key: sk,
@@ -879,16 +858,28 @@ impl Transport {
 
     /// Expect packet with padding.
     ///
+    /// Returns: Whether the operation is successful. Whether we should initiate handshake.
+    ///
     /// Length: out.len() = msg.len() + 32.
-    fn encrypt(&self, msg: &[u8], out: &mut [u8]) -> Result<(), ()> {
+    fn encrypt(&self, msg: &[u8], out: &mut [u8]) -> (Result<(), ()>, bool) {
         let c = self.send_counter.fetch_add(1, Relaxed);
+        let mut should_rekey = false;
+        if self.is_initiator && c >= REKEY_AFTER_MESSAGES {
+            should_rekey = true;
+        }
         if c >= REJECT_AFTER_MESSAGES {
             self.not_too_old.store(false, Relaxed);
-            return Err(());
+            return (Err(()), should_rekey);
         }
-        if self.created.elapsed() >= Duration::from_secs(REJECT_AFTER_TIME) {
+
+        let age = self.created.elapsed();
+
+        if age >= Duration::from_secs(REKEY_AFTER_TIME) {
+            should_rekey = true;
+        }
+        if age >= Duration::from_secs(REJECT_AFTER_TIME) {
             self.not_too_old.store(false, Relaxed);
-            return Err(());
+            return (Err(()), should_rekey);
         }
 
         out[0..4].copy_from_slice(&[4, 0, 0, 0]);
@@ -897,7 +888,7 @@ impl Transport {
 
         <ChaCha20Poly1305 as Cipher>::encrypt(&self.send_key, c, &[], msg, &mut out[16..]);
 
-        Ok(())
+        (Ok(()), should_rekey)
     }
 
     /// Returns packet maybe with padding.

@@ -107,6 +107,5 @@ pub const REJECT_AFTER_MESSAGES: u64 = 0xffffffffffffffef;
 
 pub const REKEY_AFTER_TIME: u64 = 120;
 pub const REJECT_AFTER_TIME: u64 = 180;
-pub const REKEY_ATTEMPT_TIME: u64 = 90;
 pub const REKEY_TIMEOUT: u64 = 5;
 pub const KEEPALIVE_TIMEOUT: u64 = 10;
