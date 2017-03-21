@@ -554,7 +554,7 @@ fn do_keep_alive(peer: &PeerState, sock: &UdpSocket) {
 
 // Cannot be a method because we need `Arc<WgState>`.
 pub fn wg_add_peer(wg: Arc<WgState>, peer: &PeerInfo, sock: Arc<UdpSocket>) {
-    let register = |a| wg.timer_controller.register(Instant::now(), a);
+    let register = |a| wg.timer_controller.register_delay(Duration::from_secs(0), a);
     let dummy_action = || Box::new(|| {});
 
     let mut pubkey_map = wg.pubkey_map.write().unwrap();

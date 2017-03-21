@@ -16,6 +16,7 @@
 // along with TiTun.  If not, see <https://www.gnu.org/licenses/>.
 
 #![feature(integer_atomics)]
+#![feature(retain_hash_collection)]
 #![feature(untagged_unions)]
 
 #[macro_use]
